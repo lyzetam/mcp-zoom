@@ -1,33 +1,35 @@
-"""Zoom client via Composio API.
+"""Zoom client using the Zoom REST API directly.
 
-This is the core library that can be used by:
-- MCP server (server.py)
-- CLI (cli.py)
-- zI or any other integration
+Auth is Server-to-Server OAuth: the account's own credentials are exchanged
+for a short-lived token, so there is no browser flow and no third-party
+broker in the path.
+
+This replaced a Composio-brokered transport on 2026-09-08. Composio retired
+its v2 action API (`/api/v2/actions/{ACTION}/execute` now returns 410 Gone),
+which took every Zoom tool down at once. Talking to api.zoom.us directly
+removes that dependency and, as a side effect, makes transcript downloads
+work — they need a Zoom bearer token, which the broker never exposed.
 
 Usage:
     from zoom import ZoomClient
 
-    # With explicit credentials
     client = ZoomClient(
-        composio_api_key="ak_xxx",
-        connected_account_id="xxx"
+        account_id="xxx", client_id="xxx", client_secret="xxx"
     )
 
-    # Or from environment/AWS Secrets Manager
+    # Or from environment / AWS Secrets Manager ('zoom/s2s')
     client = ZoomClient.from_env()
 
-    # Use it
-    meetings = await client.list_meetings()
+    recordings = await client.list_recordings(from_date="2026-08-01")
 """
 
 import json
 import os
+import re
+import time
 from typing import Optional
 
 import httpx
-
-import re
 
 from .models import (
     Meeting,
@@ -41,73 +43,127 @@ from .models import (
 )
 
 
-class ZoomClient:
-    """Zoom client using Composio as the OAuth/API layer."""
+class ZoomError(Exception):
+    """A Zoom API call failed."""
 
-    COMPOSIO_BASE_URL = "https://backend.composio.dev/api/v2/actions"
+
+class ZoomClient:
+    """Zoom client speaking directly to the Zoom REST API."""
+
+    API_BASE = "https://api.zoom.us/v2"
+    TOKEN_URL = "https://zoom.us/oauth/token"
+
+    # Refresh a little before expiry so a call never lands on a dead token.
+    _TOKEN_SKEW_SECONDS = 60
 
     def __init__(
         self,
-        composio_api_key: str,
-        connected_account_id: str,
+        account_id: str,
+        client_id: str,
+        client_secret: str,
         timeout: float = 30.0,
     ):
-        self.composio_api_key = composio_api_key
-        self.connected_account_id = connected_account_id
-        self._client = httpx.AsyncClient(
-            headers={
-                "X-API-Key": composio_api_key,
-                "Content-Type": "application/json",
-            },
-            timeout=timeout,
-        )
+        self.account_id = account_id
+        self.client_id = client_id
+        self.client_secret = client_secret
+        self._client = httpx.AsyncClient(timeout=timeout)
+        self._token: Optional[str] = None
+        self._token_expires_at: float = 0.0
 
     @classmethod
     def from_env(cls) -> "ZoomClient":
-        """Create client from environment variables or AWS Secrets Manager."""
-        api_key = None
-        account_id = None
+        """Build a client from AWS Secrets Manager or environment variables.
 
-        # Try AWS Secrets Manager first
+        Secrets Manager `zoom/s2s` is a JSON object with `account_id`,
+        `client_id` and `client_secret`.
+        """
+        account_id = client_id = client_secret = None
+
         try:
             import boto3
-            client = boto3.client("secretsmanager", region_name="us-east-1")
+            sm = boto3.client("secretsmanager", region_name="us-east-1")
             secret = json.loads(
-                client.get_secret_value(SecretId="composio/api-key")["SecretString"]
+                sm.get_secret_value(SecretId="zoom/s2s")["SecretString"]
             )
-            api_key = secret.get("api_key")
-            account_id = secret.get("zoom_connected_account_id")
+            account_id = secret.get("account_id")
+            client_id = secret.get("client_id")
+            client_secret = secret.get("client_secret")
         except Exception:
             pass
 
-        # Fallback to environment
-        api_key = api_key or os.environ.get("COMPOSIO_API_KEY")
-        account_id = account_id or os.environ.get("ZOOM_CONNECTED_ACCOUNT_ID")
+        account_id = account_id or os.environ.get("ZOOM_ACCOUNT_ID")
+        client_id = client_id or os.environ.get("ZOOM_CLIENT_ID")
+        client_secret = client_secret or os.environ.get("ZOOM_CLIENT_SECRET")
 
-        if not api_key or not account_id:
+        if not (account_id and client_id and client_secret):
             raise ValueError(
-                "Missing credentials. Set COMPOSIO_API_KEY and ZOOM_CONNECTED_ACCOUNT_ID "
-                "or store in AWS Secrets Manager at composio/api-key"
+                "Missing Zoom credentials. Create a Server-to-Server OAuth app "
+                "at marketplace.zoom.us, then store {account_id, client_id, "
+                "client_secret} in AWS Secrets Manager at 'zoom/s2s' or set "
+                "ZOOM_ACCOUNT_ID / ZOOM_CLIENT_ID / ZOOM_CLIENT_SECRET."
             )
 
-        return cls(composio_api_key=api_key, connected_account_id=account_id)
-
-    async def _execute(self, action: str, params: dict) -> dict:
-        """Execute a Composio action."""
-        response = await self._client.post(
-            f"{self.COMPOSIO_BASE_URL}/{action}/execute",
-            json={
-                "connectedAccountId": self.connected_account_id,
-                "input": params,
-            },
+        return cls(
+            account_id=account_id,
+            client_id=client_id,
+            client_secret=client_secret,
         )
-        response.raise_for_status()
 
-        data = response.json()
-        if not data.get("successful"):
-            raise Exception(f"Zoom action failed: {data.get('error')}")
+    # ============== AUTH ==============
 
-        return data["data"]
+    async def _get_token(self) -> str:
+        """Return a valid access token, fetching a new one only when needed."""
+        if self._token and time.time() < self._token_expires_at:
+            return self._token
+
+        response = await self._client.post(
+            self.TOKEN_URL,
+            params={
+                "grant_type": "account_credentials",
+                "account_id": self.account_id,
+            },
+            auth=(self.client_id, self.client_secret),
+        )
+        if response.status_code != 200:
+            raise ZoomError(
+                f"Zoom token request failed ({response.status_code}): {response.text}"
+            )
+
+        payload = response.json()
+        self._token = payload["access_token"]
+        self._token_expires_at = (
+            time.time() + payload.get("expires_in", 3600) - self._TOKEN_SKEW_SECONDS
+        )
+        return self._token
+
+    async def _request(
+        self,
+        method: str,
+        path: str,
+        params: Optional[dict] = None,
+        json_body: Optional[dict] = None,
+    ) -> dict:
+        """Call the Zoom API and return the decoded body."""
+        token = await self._get_token()
+        response = await self._client.request(
+            method,
+            f"{self.API_BASE}{path}",
+            params=params,
+            json=json_body,
+            headers={"Authorization": f"Bearer {token}"},
+        )
+
+        if response.status_code >= 400:
+            message = response.text
+            try:
+                message = response.json().get("message", message)
+            except Exception:
+                pass
+            raise ZoomError(f"Zoom {method} {path} failed ({response.status_code}): {message}")
+
+        if not response.content:
+            return {}
+        return response.json()
 
     async def close(self):
         """Close the HTTP client."""
@@ -127,10 +183,10 @@ class ZoomClient:
         Args:
             meeting_type: 'upcoming', 'scheduled', 'live', or 'pending'
         """
-        data = await self._execute("ZOOM_LIST_MEETINGS", {
-            "userId": "me",
-            "type": meeting_type,
-        })
+        data = await self._request(
+            "GET", "/users/me/meetings",
+            params={"type": meeting_type, "page_size": 300},
+        )
 
         return [
             Meeting(
@@ -146,8 +202,7 @@ class ZoomClient:
 
     async def create_meeting(self, meeting: MeetingCreate) -> Meeting:
         """Create a new meeting."""
-        params = {
-            "userId": "me",
+        body = {
             "topic": meeting.topic,
             "type": 2,
             "start_time": meeting.start_time,
@@ -162,9 +217,9 @@ class ZoomClient:
             },
         }
         if meeting.agenda:
-            params["agenda"] = meeting.agenda
+            body["agenda"] = meeting.agenda
 
-        data = await self._execute("ZOOM_CREATE_A_MEETING", params)
+        data = await self._request("POST", "/users/me/meetings", json_body=body)
 
         return Meeting(
             id=data["id"],
@@ -180,7 +235,7 @@ class ZoomClient:
 
     async def get_meeting(self, meeting_id: int) -> Meeting:
         """Get meeting details."""
-        data = await self._execute("ZOOM_GET_A_MEETING", {"meetingId": meeting_id})
+        data = await self._request("GET", f"/meetings/{meeting_id}")
 
         return Meeting(
             id=data["id"],
@@ -204,17 +259,17 @@ class ZoomClient:
         agenda: Optional[str] = None,
     ) -> None:
         """Update a meeting."""
-        params = {"meetingId": meeting_id}
+        body = {}
         if topic:
-            params["topic"] = topic
+            body["topic"] = topic
         if start_time:
-            params["start_time"] = start_time
+            body["start_time"] = start_time
         if duration:
-            params["duration"] = duration
+            body["duration"] = duration
         if agenda:
-            params["agenda"] = agenda
+            body["agenda"] = agenda
 
-        await self._execute("ZOOM_UPDATE_A_MEETING", params)
+        await self._request("PATCH", f"/meetings/{meeting_id}", json_body=body)
 
     async def add_registrant(
         self,
@@ -224,12 +279,14 @@ class ZoomClient:
         last_name: str = "",
     ) -> Registrant:
         """Add a meeting registrant."""
-        data = await self._execute("ZOOM_ADD_A_MEETING_REGISTRANT", {
-            "meetingId": str(meeting_id),
-            "email": email,
-            "first_name": first_name,
-            "last_name": last_name,
-        })
+        data = await self._request(
+            "POST", f"/meetings/{meeting_id}/registrants",
+            json_body={
+                "email": email,
+                "first_name": first_name,
+                "last_name": last_name,
+            },
+        )
 
         return Registrant(
             registrant_id=data.get("registrant_id"),
@@ -247,11 +304,11 @@ class ZoomClient:
         to_date: Optional[str] = None,
     ) -> list[Recording]:
         """List cloud recordings in date range."""
-        params = {"userId": "me", "from": from_date}
+        params = {"from": from_date, "page_size": 300}
         if to_date:
             params["to"] = to_date
 
-        data = await self._execute("ZOOM_LIST_ALL_RECORDINGS", params)
+        data = await self._request("GET", "/users/me/recordings", params=params)
 
         return [
             Recording(
@@ -266,9 +323,7 @@ class ZoomClient:
 
     async def get_recording(self, meeting_id: int) -> Recording:
         """Get recording details for a meeting."""
-        data = await self._execute("ZOOM_GET_MEETING_RECORDINGS", {
-            "meetingId": str(meeting_id),
-        })
+        data = await self._request("GET", f"/meetings/{meeting_id}/recordings")
 
         from .models import RecordingFile
 
@@ -296,9 +351,10 @@ class ZoomClient:
 
     async def get_participants(self, meeting_id: int) -> list[Participant]:
         """Get participants from a past meeting."""
-        data = await self._execute("ZOOM_GET_PAST_MEETING_PARTICIPANTS", {
-            "meetingId": str(meeting_id),
-        })
+        data = await self._request(
+            "GET", f"/past_meetings/{meeting_id}/participants",
+            params={"page_size": 300},
+        )
 
         return [
             Participant(
@@ -313,15 +369,15 @@ class ZoomClient:
 
     async def get_meeting_summary(self, meeting_id: int) -> MeetingSummary:
         """Get AI-generated meeting summary."""
-        data = await self._execute("ZOOM_GET_A_MEETING_SUMMARY", {
-            "meetingId": str(meeting_id),
-        })
+        data = await self._request("GET", f"/meetings/{meeting_id}/meeting_summary")
 
         return MeetingSummary(
             meeting_id=meeting_id,
-            summary=data.get("summary"),
+            summary=data.get("summary_overview") or data.get("summary"),
             next_steps=data.get("next_steps"),
-            topics=data.get("topics"),
+            topics=[
+                d.get("summary") for d in data.get("summary_details", [])
+            ] or data.get("topics"),
         )
 
     # ============== TRANSCRIPT ==============
@@ -368,36 +424,33 @@ class ZoomClient:
         return entries
 
     async def _download_transcript_text(self, download_url: str) -> Optional[str]:
-        """Fetch raw VTT/CC content. Tries anonymous, then Composio-proxied download.
+        """Fetch raw VTT/CC content using the account's own bearer token.
 
-        Returns None if both fail.
+        Zoom's download URLs require the same OAuth token as the API. Returns
+        None if the body does not look like VTT, so a login redirect page is
+        never mistaken for a transcript.
         """
-        # Attempt 1: direct anonymous download (works when recording is public-shared)
+        token = await self._get_token()
         try:
-            resp = await self._client.get(download_url, follow_redirects=True)
-            if resp.status_code == 200 and "WEBVTT" in resp.text[:200].upper():
-                return resp.text
+            response = await self._client.get(
+                download_url,
+                headers={"Authorization": f"Bearer {token}"},
+                follow_redirects=True,
+            )
         except Exception:
-            pass
+            return None
 
-        # Attempt 2: Composio proxied download (if this action is available in the account)
-        try:
-            data = await self._execute("ZOOM_DOWNLOAD_RECORDING_FILE", {
-                "downloadUrl": download_url,
-            })
-            content = data.get("content") or data.get("text") or data.get("body")
-            if content and "WEBVTT" in content[:200].upper():
-                return content
-        except Exception:
-            pass
-
+        if response.status_code == 200 and "WEBVTT" in response.text[:200].upper():
+            return response.text
         return None
 
     async def get_transcript(self, meeting_id: int) -> MeetingTranscript:
         """Fetch and parse the transcript (VTT) for a past meeting.
 
-        Falls back from anonymous download → Composio proxy → metadata-only
-        if the raw file is unreachable without additional auth.
+        Raises ZoomError when the meeting has no cloud recording at all.
+        Returns a `note` when a recording exists but carries no transcript
+        file — that means the call was recorded without audio transcription
+        enabled, and no transcript exists to recover.
         """
         recording = await self.get_recording(meeting_id)
 
@@ -409,8 +462,9 @@ class ZoomClient:
             return MeetingTranscript(
                 meeting_id=meeting_id,
                 source="NONE",
-                note="No TRANSCRIPT or CC file found for this meeting. "
-                     "Ensure cloud recording with audio transcription was enabled.",
+                note="No TRANSCRIPT or CC file found for this meeting. The call "
+                     "was recorded without audio transcription enabled, so no "
+                     "transcript exists to recover.",
             )
 
         raw = None
@@ -423,9 +477,9 @@ class ZoomClient:
                 source=transcript_file.file_type,
                 file_id=transcript_file.id,
                 download_url=transcript_file.download_url,
-                note="Transcript file exists but could not be fetched without "
-                     "additional auth. Download the URL manually or extend Composio "
-                     "with a download-recording action.",
+                note="Transcript file exists but the download did not return VTT. "
+                     "Check that the Server-to-Server OAuth app has the "
+                     "cloud_recording:read:list_recording_files:admin scope.",
             )
 
         entries = self._parse_vtt(raw)
