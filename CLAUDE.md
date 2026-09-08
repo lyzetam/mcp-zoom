@@ -36,7 +36,7 @@ pytest
                               │
                               ▼
                     ┌─────────────────┐
-                    │    Composio     │  ← OAuth layer
+                    │  S2S OAuth      │  ← account credentials
                     │  (v2 Actions)   │
                     └─────────────────┘
                               │
@@ -48,18 +48,22 @@ pytest
 
 **Key Design:** Core logic lives in `src/zoom/client.py`. Both `server.py` (MCP) and `cli.py` are thin wrappers that call `ZoomClient` methods. This allows the same code to be imported by zI or any other integration.
 
-## Composio Integration
+## Auth: Server-to-Server OAuth
 
-This server doesn't call Zoom API directly. Composio handles:
+This server calls the Zoom REST API directly. Auth handles:
 - OAuth token storage and refresh
 - Rate limiting and retries
 - Unified action execution API
 
-All operations go through `ZOOM_*` Composio actions via their v2 execute endpoint.
+All operations are plain REST calls to `https://api.zoom.us/v2`.
+
+> **History:** this server used Composio as its API layer until 2026-09-08,
+> when Composio retired `/api/v2/actions/{ACTION}/execute` (410 Gone) and every
+> tool broke at once. Do not reintroduce that dependency.
 
 ## Credentials
 
-**AWS Secret:** `composio/api-key`
+**AWS Secret:** `zoom/s2s` — `{account_id, client_id, client_secret}`
 ```json
 {
   "api_key": "ak_xxx",
@@ -69,19 +73,19 @@ All operations go through `ZOOM_*` Composio actions via their v2 execute endpoin
 
 `ZoomClient.from_env()` auto-loads from AWS Secrets Manager, falls back to environment variables.
 
-## Tools → Composio Actions Mapping
+## Tools → Zoom Endpoints
 
-| MCP Tool | Composio Action |
+| MCP Tool | Zoom Endpoint |
 |----------|-----------------|
-| `list_meetings` | `ZOOM_LIST_MEETINGS` |
-| `create_meeting` | `ZOOM_CREATE_A_MEETING` |
-| `get_meeting` | `ZOOM_GET_A_MEETING` |
-| `update_meeting` | `ZOOM_UPDATE_A_MEETING` |
-| `add_registrant` | `ZOOM_ADD_A_MEETING_REGISTRANT` |
-| `list_recordings` | `ZOOM_LIST_ALL_RECORDINGS` |
-| `get_recording` | `ZOOM_GET_MEETING_RECORDINGS` |
-| `get_participants` | `ZOOM_GET_PAST_MEETING_PARTICIPANTS` |
-| `get_meeting_summary` | `ZOOM_GET_A_MEETING_SUMMARY` |
+| `list_meetings` | `GET /users/me/meetings` |
+| `create_meeting` | `POST /users/me/meetings` |
+| `get_meeting` | `GET /meetings/{id}` |
+| `update_meeting` | `PATCH /meetings/{id}` |
+| `add_registrant` | `POST /meetings/{id}/registrants` |
+| `list_recordings` | `GET /users/me/recordings` |
+| `get_recording` | `GET /meetings/{id}/recordings` |
+| `get_participants` | `GET /past_meetings/{id}/participants` |
+| `get_meeting_summary` | `GET /meetings/{id}/meeting_summary` |
 
 ## Library Usage (for zI)
 
