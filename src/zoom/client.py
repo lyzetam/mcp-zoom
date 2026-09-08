@@ -27,13 +27,17 @@ from typing import Optional
 
 import httpx
 
+import re
+
 from .models import (
     Meeting,
     MeetingCreate,
+    MeetingSummary,
+    MeetingTranscript,
     Participant,
     Recording,
     Registrant,
-    MeetingSummary,
+    TranscriptEntry,
 )
 
 
@@ -221,7 +225,7 @@ class ZoomClient:
     ) -> Registrant:
         """Add a meeting registrant."""
         data = await self._execute("ZOOM_ADD_A_MEETING_REGISTRANT", {
-            "meetingId": meeting_id,
+            "meetingId": str(meeting_id),
             "email": email,
             "first_name": first_name,
             "last_name": last_name,
@@ -263,7 +267,7 @@ class ZoomClient:
     async def get_recording(self, meeting_id: int) -> Recording:
         """Get recording details for a meeting."""
         data = await self._execute("ZOOM_GET_MEETING_RECORDINGS", {
-            "meetingId": meeting_id,
+            "meetingId": str(meeting_id),
         })
 
         from .models import RecordingFile
@@ -293,7 +297,7 @@ class ZoomClient:
     async def get_participants(self, meeting_id: int) -> list[Participant]:
         """Get participants from a past meeting."""
         data = await self._execute("ZOOM_GET_PAST_MEETING_PARTICIPANTS", {
-            "meetingId": meeting_id,
+            "meetingId": str(meeting_id),
         })
 
         return [
@@ -310,7 +314,7 @@ class ZoomClient:
     async def get_meeting_summary(self, meeting_id: int) -> MeetingSummary:
         """Get AI-generated meeting summary."""
         data = await self._execute("ZOOM_GET_A_MEETING_SUMMARY", {
-            "meetingId": meeting_id,
+            "meetingId": str(meeting_id),
         })
 
         return MeetingSummary(
@@ -318,4 +322,121 @@ class ZoomClient:
             summary=data.get("summary"),
             next_steps=data.get("next_steps"),
             topics=data.get("topics"),
+        )
+
+    # ============== TRANSCRIPT ==============
+
+    _TRANSCRIPT_FILE_TYPES = ("TRANSCRIPT", "CC")
+
+    @staticmethod
+    def _parse_vtt(vtt: str) -> list[TranscriptEntry]:
+        """Parse WEBVTT content into structured entries.
+
+        Handles the common Zoom format where speaker is prefixed like
+        "Landry Zetam: hello world" on the content line.
+        """
+        entries: list[TranscriptEntry] = []
+        blocks = re.split(r"\n\s*\n", vtt.strip())
+        for block in blocks:
+            if block.upper().startswith("WEBVTT"):
+                continue
+            lines = [ln for ln in block.splitlines() if ln.strip()]
+            if not lines:
+                continue
+            # Optional cue identifier on first line
+            if "-->" not in lines[0] and len(lines) > 1:
+                lines = lines[1:]
+            if not lines or "-->" not in lines[0]:
+                continue
+            start, _, end = lines[0].partition("-->")
+            content = " ".join(ln.strip() for ln in lines[1:]).strip()
+            if not content:
+                continue
+            speaker: Optional[str] = None
+            if ":" in content:
+                maybe_speaker, _, rest = content.partition(":")
+                # Simple heuristic: speaker is short, no sentence punctuation
+                if len(maybe_speaker) < 60 and "." not in maybe_speaker and "?" not in maybe_speaker:
+                    speaker = maybe_speaker.strip()
+                    content = rest.strip()
+            entries.append(TranscriptEntry(
+                start=start.strip(),
+                end=end.strip(),
+                speaker=speaker,
+                text=content,
+            ))
+        return entries
+
+    async def _download_transcript_text(self, download_url: str) -> Optional[str]:
+        """Fetch raw VTT/CC content. Tries anonymous, then Composio-proxied download.
+
+        Returns None if both fail.
+        """
+        # Attempt 1: direct anonymous download (works when recording is public-shared)
+        try:
+            resp = await self._client.get(download_url, follow_redirects=True)
+            if resp.status_code == 200 and "WEBVTT" in resp.text[:200].upper():
+                return resp.text
+        except Exception:
+            pass
+
+        # Attempt 2: Composio proxied download (if this action is available in the account)
+        try:
+            data = await self._execute("ZOOM_DOWNLOAD_RECORDING_FILE", {
+                "downloadUrl": download_url,
+            })
+            content = data.get("content") or data.get("text") or data.get("body")
+            if content and "WEBVTT" in content[:200].upper():
+                return content
+        except Exception:
+            pass
+
+        return None
+
+    async def get_transcript(self, meeting_id: int) -> MeetingTranscript:
+        """Fetch and parse the transcript (VTT) for a past meeting.
+
+        Falls back from anonymous download → Composio proxy → metadata-only
+        if the raw file is unreachable without additional auth.
+        """
+        recording = await self.get_recording(meeting_id)
+
+        transcript_file = next(
+            (f for f in recording.files if f.file_type in self._TRANSCRIPT_FILE_TYPES),
+            None,
+        )
+        if transcript_file is None:
+            return MeetingTranscript(
+                meeting_id=meeting_id,
+                source="NONE",
+                note="No TRANSCRIPT or CC file found for this meeting. "
+                     "Ensure cloud recording with audio transcription was enabled.",
+            )
+
+        raw = None
+        if transcript_file.download_url:
+            raw = await self._download_transcript_text(transcript_file.download_url)
+
+        if not raw:
+            return MeetingTranscript(
+                meeting_id=meeting_id,
+                source=transcript_file.file_type,
+                file_id=transcript_file.id,
+                download_url=transcript_file.download_url,
+                note="Transcript file exists but could not be fetched without "
+                     "additional auth. Download the URL manually or extend Composio "
+                     "with a download-recording action.",
+            )
+
+        entries = self._parse_vtt(raw)
+        plain_text = "\n".join(
+            f"{e.speaker}: {e.text}" if e.speaker else e.text for e in entries
+        )
+        return MeetingTranscript(
+            meeting_id=meeting_id,
+            source=transcript_file.file_type,
+            file_id=transcript_file.id,
+            download_url=transcript_file.download_url,
+            entries=entries,
+            plain_text=plain_text,
         )

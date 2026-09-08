@@ -9,6 +9,21 @@ Usage:
 """
 
 from .client import ZoomClient
-from .models import Meeting, Recording, Participant
+from .models import (
+    Meeting,
+    MeetingSummary,
+    MeetingTranscript,
+    Participant,
+    Recording,
+    TranscriptEntry,
+)
 
-__all__ = ["ZoomClient", "Meeting", "Recording", "Participant"]
+__all__ = [
+    "ZoomClient",
+    "Meeting",
+    "MeetingSummary",
+    "MeetingTranscript",
+    "Participant",
+    "Recording",
+    "TranscriptEntry",
+]

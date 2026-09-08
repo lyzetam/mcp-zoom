@@ -182,5 +182,39 @@ async def get_meeting_summary(meeting_id: int) -> str:
     return json.dumps(summary.model_dump(mode="json"), indent=2)
 
 
+# ============== TRANSCRIPT TOOLS ==============
+
+@mcp.tool()
+async def get_transcript(meeting_id: int) -> str:
+    """Get the full transcript (VTT/CC) for a past meeting, parsed into
+    timestamped entries plus a single plain-text block.
+
+    Requires cloud recording with audio transcription enabled for the meeting.
+    If the file exists but cannot be downloaded anonymously or via Composio,
+    returns metadata + a `note` explaining how to fetch it manually.
+
+    Args:
+        meeting_id: The Zoom meeting ID (must be a past meeting with a recording)
+    """
+    client = get_client()
+    transcript = await client.get_transcript(meeting_id)
+    return json.dumps(transcript.model_dump(mode="json"), indent=2)
+
+
+@mcp.tool()
+async def get_transcript_text(meeting_id: int) -> str:
+    """Get only the plain-text body of a meeting transcript — no JSON wrapper,
+    no timestamps. Useful for piping into an LLM for summarization.
+
+    Args:
+        meeting_id: The Zoom meeting ID (must be a past meeting with a recording)
+    """
+    client = get_client()
+    transcript = await client.get_transcript(meeting_id)
+    if not transcript.plain_text:
+        return transcript.note or "No transcript content available."
+    return transcript.plain_text
+
+
 if __name__ == "__main__":
     mcp.run()

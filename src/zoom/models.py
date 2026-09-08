@@ -76,3 +76,22 @@ class MeetingSummary(BaseModel):
     summary: Optional[str] = None
     next_steps: Optional[list[str]] = None
     topics: Optional[list[str]] = None
+
+
+class TranscriptEntry(BaseModel):
+    """Single timestamped utterance in a transcript."""
+    start: str
+    end: str
+    speaker: Optional[str] = None
+    text: str
+
+
+class MeetingTranscript(BaseModel):
+    """Full meeting transcript (VTT/CC parsed)."""
+    meeting_id: int
+    source: str  # "TRANSCRIPT" (audio transcript) or "CC" (closed captions)
+    file_id: Optional[str] = None
+    download_url: Optional[str] = None
+    entries: list[TranscriptEntry] = Field(default_factory=list)
+    plain_text: str = ""
+    note: Optional[str] = None  # populated when raw VTT couldn't be fetched
