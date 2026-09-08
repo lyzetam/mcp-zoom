@@ -1,6 +1,7 @@
 # mcp-zoom
 
-Zoom client library with MCP server and CLI interfaces. Uses Composio as the OAuth/API layer.
+Zoom client library with MCP server and CLI interfaces. Talks to the Zoom REST
+API directly using Server-to-Server OAuth.
 
 ## Architecture
 
@@ -20,8 +21,8 @@ Zoom client library with MCP server and CLI interfaces. Uses Composio as the OAu
                               │
                               ▼
                     ┌─────────────────┐
-                    │    Composio     │  ← OAuth management
-                    │   (API layer)   │
+                    │  S2S OAuth      │  ← account credentials → token
+                    │  zoom.us/oauth  │
                     └─────────────────┘
                               │
                               ▼
@@ -44,10 +45,11 @@ Set credentials via environment or AWS Secrets Manager:
 
 ```bash
 # Environment variables
-export COMPOSIO_API_KEY="ak_xxx"
-export ZOOM_CONNECTED_ACCOUNT_ID="xxx"
+export ZOOM_ACCOUNT_ID="xxx"
+export ZOOM_CLIENT_ID="xxx"
+export ZOOM_CLIENT_SECRET="xxx"
 
-# Or store in AWS Secrets Manager at 'composio/api-key'
+# Or store {account_id, client_id, client_secret} in AWS Secrets Manager at 'zoom/s2s'
 # with keys: api_key, zoom_connected_account_id
 ```
 
@@ -62,7 +64,7 @@ from zoom.models import MeetingCreate
 # Create client
 client = ZoomClient.from_env()  # From env/AWS
 # or
-client = ZoomClient(composio_api_key="...", connected_account_id="...")
+client = ZoomClient(account_id="...", client_id="...", client_secret="...")
 
 # List meetings
 meetings = await client.list_meetings()
@@ -109,7 +111,7 @@ Add to `~/.claude.json`:
       "command": "uv",
       "args": ["run", "--directory", "/Users/zz/dev/mcp-zoom", "python", "server.py"],
       "env": {
-        "COMPOSIO_API_KEY": "...",
+        "ZOOM_ACCOUNT_ID": "...",
         "ZOOM_CONNECTED_ACCOUNT_ID": "..."
       }
     }

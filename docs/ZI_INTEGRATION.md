@@ -22,7 +22,7 @@ zI Agent
 └─────────────────────────────────────┘
     │
     ▼
-Composio API (OAuth layer)
+Zoom REST API (Server-to-Server OAuth)
     │
     ▼
 Zoom API
@@ -48,7 +48,7 @@ mcp-zoom @ git+https://github.com/lyzetam/mcp-zoom.git
 
 Credentials are fetched from AWS Secrets Manager automatically:
 
-**Secret:** `composio/api-key`
+**Secret:** `zoom/s2s`
 ```json
 {
   "api_key": "ak_xxx",
@@ -57,8 +57,9 @@ Credentials are fetched from AWS Secrets Manager automatically:
 ```
 
 Fallback to environment variables:
-- `COMPOSIO_API_KEY`
-- `ZOOM_CONNECTED_ACCOUNT_ID`
+- `ZOOM_ACCOUNT_ID`
+- `ZOOM_CLIENT_ID`
+- `ZOOM_CLIENT_SECRET`
 
 ## Usage in zI
 
@@ -154,7 +155,9 @@ async with ZoomClient.from_env() as client:
 
 ```python
 client = ZoomClient(
-    composio_api_key="ak_xxx",
+    account_id="xxx",
+    client_id="xxx",
+    client_secret="xxx",
     connected_account_id="xxx",
 )
 ```
@@ -198,7 +201,7 @@ class Meeting(BaseModel):
 try:
     meeting = await client.get_meeting(invalid_id)
 except Exception as e:
-    # Composio/Zoom API errors raised as exceptions
+    # Zoom API errors raised as ZoomError
     print(f"Error: {e}")
 ```
 
@@ -285,6 +288,6 @@ mcp-zoom/
 ## Support
 
 For issues with:
-- **OAuth/Auth**: Check Composio dashboard at platform.composio.dev
+- **OAuth/Auth**: Check the Server-to-Server OAuth app at marketplace.zoom.us
 - **API errors**: Check Zoom API status and rate limits
-- **Credentials**: Verify AWS Secrets Manager secret `composio/api-key`
+- **Credentials**: Verify AWS Secrets Manager secret `zoom/s2s`

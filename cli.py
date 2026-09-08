@@ -162,6 +162,33 @@ async def cmd_summary(args):
             print(f"  - {topic}")
 
 
+async def cmd_transcript(args):
+    """Get meeting transcript."""
+    async with ZoomClient.from_env() as client:
+        transcript = await client.get_transcript(args.meeting_id)
+
+    if args.text_only:
+        if transcript.plain_text:
+            print(transcript.plain_text)
+        elif transcript.note:
+            print(transcript.note, file=sys.stderr)
+            sys.exit(2)
+        return
+
+    print(f"Transcript (source: {transcript.source}) for meeting {transcript.meeting_id}")
+    if transcript.note:
+        print(f"Note: {transcript.note}")
+        if transcript.download_url:
+            print(f"Download URL: {transcript.download_url}")
+        return
+
+    for e in transcript.entries:
+        prefix = f"[{e.start}] "
+        if e.speaker:
+            prefix += f"{e.speaker}: "
+        print(f"{prefix}{e.text}")
+
+
 def main():
     parser = argparse.ArgumentParser(description="Zoom CLI")
     parser.add_argument("--json", action="store_true", help="Output as JSON")
@@ -209,6 +236,12 @@ def main():
     sum_p = subparsers.add_parser("summary", help="Get meeting summary")
     sum_p.add_argument("meeting_id", type=int)
 
+    # transcript
+    tr_p = subparsers.add_parser("transcript", help="Get meeting transcript (VTT parsed)")
+    tr_p.add_argument("meeting_id", type=int)
+    tr_p.add_argument("--text-only", action="store_true",
+                      help="Print only the plain text body (no timestamps/speakers)")
+
     args = parser.parse_args()
 
     commands = {
@@ -220,6 +253,7 @@ def main():
         "recording": cmd_recording,
         "participants": cmd_participants,
         "summary": cmd_summary,
+        "transcript": cmd_transcript,
     }
 
     try:
